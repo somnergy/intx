@@ -113,7 +113,26 @@ struct div_result
 /// Addition with carry.
 constexpr result_with_carry<uint64_t> addc(uint64_t x, uint64_t y, bool carry = false) noexcept
 {
-#if __has_builtin(__builtin_addcll)
+    // On rv32im, __builtin_addcll generates ~30 instructions with branches because
+    // GCC's 64-bit carry detection on 32-bit targets uses conditional branches.
+    // Manual 32-bit decomposition compiles to ~14 branchless add/sltu instructions.
+#if defined(__riscv) && __riscv_xlen == 32
+    const auto x_lo = static_cast<uint32_t>(x);
+    const auto x_hi = static_cast<uint32_t>(x >> 32);
+    const auto y_lo = static_cast<uint32_t>(y);
+    const auto y_hi = static_cast<uint32_t>(y >> 32);
+
+    auto lo = x_lo + y_lo;
+    uint32_t c = (lo < x_lo);
+    lo += carry;
+    c += (lo < static_cast<uint32_t>(carry));
+    auto hi = x_hi + y_hi;
+    uint32_t cout = (hi < x_hi);
+    hi += c;
+    cout += (hi < c);
+
+    return {(static_cast<uint64_t>(hi) << 32) | lo, cout != 0};
+#elif __has_builtin(__builtin_addcll)
     if (!std::is_constant_evaluated())
     {
         unsigned long long carryout = 0;  // NOLINT(google-runtime-int)
@@ -131,18 +150,38 @@ constexpr result_with_carry<uint64_t> addc(uint64_t x, uint64_t y, bool carry = 
     }
 #endif
 
+#if !defined(__riscv) || __riscv_xlen != 32
     const auto s = x + y;
     const auto carry1 = s < x;
     const auto t = s + carry;
     const auto carry2 = t < s;
     return {t, carry1 || carry2};
+#endif
 }
 
 /// Subtraction with carry (borrow).
 constexpr result_with_carry<uint64_t> subc(uint64_t x, uint64_t y, bool carry = false) noexcept
 {
+    // On rv32im, __builtin_subcll generates ~30 instructions with branches.
+    // Manual 32-bit decomposition compiles to ~14 branchless sub/sltu instructions.
+#if defined(__riscv) && __riscv_xlen == 32
+    const auto x_lo = static_cast<uint32_t>(x);
+    const auto x_hi = static_cast<uint32_t>(x >> 32);
+    const auto y_lo = static_cast<uint32_t>(y);
+    const auto y_hi = static_cast<uint32_t>(y >> 32);
+
+    auto lo = x_lo - y_lo;
+    uint32_t b = (x_lo < y_lo);
+    const auto lo2 = lo - carry;
+    b += (lo < static_cast<uint32_t>(carry));
+    auto hi = x_hi - y_hi;
+    uint32_t bout = (x_hi < y_hi);
+    const auto hi2 = hi - b;
+    bout += (hi < b);
+
+    return {(static_cast<uint64_t>(hi2) << 32) | lo2, bout != 0};
 // Use __builtin_subcll if available (except buggy Xcode 14.3.1 on arm64).
-#if __has_builtin(__builtin_subcll) && __apple_build_version__ != 14030022
+#elif __has_builtin(__builtin_subcll) && __apple_build_version__ != 14030022
     if (!std::is_constant_evaluated())
     {
         unsigned long long carryout = 0;  // NOLINT(google-runtime-int)
@@ -160,11 +199,13 @@ constexpr result_with_carry<uint64_t> subc(uint64_t x, uint64_t y, bool carry = 
     }
 #endif
 
+#if !defined(__riscv) || __riscv_xlen != 32
     const auto d = x - y;
     const auto carry1 = x < y;
     const auto e = d - carry;
     const auto carry2 = d < uint64_t{carry};
     return {e, carry1 || carry2};
+#endif
 }
 
 /// Addition with carry.
@@ -437,7 +478,33 @@ constexpr uint128 fast_add(uint128 x, uint128 y) noexcept
 /// Full unsigned multiplication 64 x 64 -> 128.
 constexpr uint128 umul(uint64_t x, uint64_t y) noexcept
 {
-#if INTX_HAS_BUILTIN_INT128
+#if defined(__riscv) && __riscv_xlen == 32
+    // rv32im: use uint32_t operands so GCC emits native mul+mulhu pairs
+    // (4 pairs for the cross-products) instead of __muldi3/__multi3 libcalls.
+    if (!std::is_constant_evaluated())
+    {
+        const auto xl = static_cast<uint32_t>(x);
+        const auto xh = static_cast<uint32_t>(x >> 32);
+        const auto yl = static_cast<uint32_t>(y);
+        const auto yh = static_cast<uint32_t>(y >> 32);
+
+        // Each uint64_t(u32) * uint64_t(u32) compiles to mul+mulhu on rv32im.
+        const uint64_t t0 = static_cast<uint64_t>(xl) * yl;
+        const uint64_t t1 = static_cast<uint64_t>(xh) * yl;
+        const uint64_t t2 = static_cast<uint64_t>(xl) * yh;
+        const uint64_t t3 = static_cast<uint64_t>(xh) * yh;
+
+        const uint64_t u1 = t1 + static_cast<uint32_t>(t0 >> 32);
+        const uint64_t u2 = t2 + static_cast<uint32_t>(u1);
+
+        const uint64_t lo =
+            (static_cast<uint64_t>(static_cast<uint32_t>(u2)) << 32) |
+            static_cast<uint32_t>(t0);
+        const uint64_t hi = t3 + (u2 >> 32) + (u1 >> 32);
+        return {lo, hi};
+    }
+    // constexpr: fall through to portable path below.
+#elif INTX_HAS_BUILTIN_INT128
     return builtin_uint128{x} * builtin_uint128{y};
 #elif defined(_MSC_VER) && _MSC_VER >= 1925 && defined(_M_X64)
     if (!std::is_constant_evaluated())
@@ -523,6 +590,15 @@ constexpr uint16_t bswap(uint16_t x) noexcept
 
 constexpr uint32_t bswap(uint32_t x) noexcept
 {
+    // On rv32im without Zbb, __builtin_bswap32 generates a __bswapsi2 libcall.
+    // Use inline shift-and-mask that compiles to ~8 instructions.
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    if (!std::is_constant_evaluated())
+    {
+        const auto a = ((x << 8) & 0xFF00FF00u) | ((x >> 8) & 0x00FF00FFu);
+        return (a << 16) | (a >> 16);
+    }
+#endif
 #if __has_builtin(__builtin_bswap32)
     return __builtin_bswap32(x);
 #else
@@ -537,6 +613,16 @@ constexpr uint32_t bswap(uint32_t x) noexcept
 
 constexpr uint64_t bswap(uint64_t x) noexcept
 {
+    // On rv32im without Zbb, __builtin_bswap64 generates a __bswapdi2 libcall.
+    // Decompose into two inline bswap32 + half-swap: ~18 instructions vs libcall.
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    if (!std::is_constant_evaluated())
+    {
+        const auto lo = static_cast<uint32_t>(x);
+        const auto hi = static_cast<uint32_t>(x >> 32);
+        return (static_cast<uint64_t>(bswap(lo)) << 32) | bswap(hi);
+    }
+#endif
 #if __has_builtin(__builtin_bswap64)
     return __builtin_bswap64(x);
 #else
@@ -993,6 +1079,129 @@ public:
     /// and discarding the high part of the result product.
     friend constexpr uint operator*(const uint& x, const uint& y) noexcept
     {
+#if defined(__riscv) && __riscv_xlen == 32
+        // rv32im specialization for uint256: work with native uint32_t limbs.
+        // Each uint64_t word is two uint32_t halves (little-endian), giving 8 limbs
+        // per uint256. We only need the low 256 bits (limbs 0..7), so we skip
+        // any product where i+j >= 8. This gives 36 mul+mulhu pairs vs 64 for full.
+        // Fully unrolled column-wise accumulation with a 3-word (96-bit) accumulator
+        // {c2, c1, c0} to avoid overflow: max column has 8 products, each <= 2^64-2^33+1,
+        // sum <= 8*(2^64) < 2^67, plus carry_in < 2^35, well within 96 bits.
+        if constexpr (N == 256)
+        {
+            if (!std::is_constant_evaluated())
+            {
+                const uint32_t a0 = static_cast<uint32_t>(x[0]);
+                const uint32_t a1 = static_cast<uint32_t>(x[0] >> 32);
+                const uint32_t a2 = static_cast<uint32_t>(x[1]);
+                const uint32_t a3 = static_cast<uint32_t>(x[1] >> 32);
+                const uint32_t a4 = static_cast<uint32_t>(x[2]);
+                const uint32_t a5 = static_cast<uint32_t>(x[2] >> 32);
+                const uint32_t a6 = static_cast<uint32_t>(x[3]);
+                const uint32_t a7 = static_cast<uint32_t>(x[3] >> 32);
+
+                const uint32_t b0 = static_cast<uint32_t>(y[0]);
+                const uint32_t b1 = static_cast<uint32_t>(y[0] >> 32);
+                const uint32_t b2 = static_cast<uint32_t>(y[1]);
+                const uint32_t b3 = static_cast<uint32_t>(y[1] >> 32);
+                const uint32_t b4 = static_cast<uint32_t>(y[2]);
+                const uint32_t b5 = static_cast<uint32_t>(y[2] >> 32);
+                const uint32_t b6 = static_cast<uint32_t>(y[3]);
+                const uint32_t b7 = static_cast<uint32_t>(y[3] >> 32);
+
+                // 96-bit accumulator {c2, c1, c0} to prevent overflow.
+                // MAC: acc += (uint64_t)ai * bj
+                // After each column: result limb = c0, shift right by 32.
+                uint32_t c0 = 0, c1 = 0, c2 = 0;
+                uint64_t t;
+
+                // Macro: accumulate one product into {c2,c1,c0}.
+                // t = (uint64_t)ai * bj; c0 += lo(t); carry -> c1 += hi(t) + carry; -> c2
+                #define INTX_RV32_MAC(ai, bj)                               \
+                    t = static_cast<uint64_t>(ai) * (bj);                   \
+                    c0 += static_cast<uint32_t>(t);                         \
+                    t = static_cast<uint64_t>(c1) +                         \
+                        static_cast<uint32_t>(t >> 32) + (c0 < static_cast<uint32_t>(t)); \
+                    c1 = static_cast<uint32_t>(t);                          \
+                    c2 += static_cast<uint32_t>(t >> 32);
+
+                uint32_t r0, r1, r2, r3, r4, r5, r6, r7;
+
+                // Column 0 (1 product)
+                t = static_cast<uint64_t>(a0) * b0;
+                c0 = static_cast<uint32_t>(t);
+                c1 = static_cast<uint32_t>(t >> 32);
+                c2 = 0;
+                r0 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 1 (2 products)
+                INTX_RV32_MAC(a0, b1)
+                INTX_RV32_MAC(a1, b0)
+                r1 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 2 (3 products)
+                INTX_RV32_MAC(a0, b2)
+                INTX_RV32_MAC(a1, b1)
+                INTX_RV32_MAC(a2, b0)
+                r2 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 3 (4 products)
+                INTX_RV32_MAC(a0, b3)
+                INTX_RV32_MAC(a1, b2)
+                INTX_RV32_MAC(a2, b1)
+                INTX_RV32_MAC(a3, b0)
+                r3 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 4 (5 products)
+                INTX_RV32_MAC(a0, b4)
+                INTX_RV32_MAC(a1, b3)
+                INTX_RV32_MAC(a2, b2)
+                INTX_RV32_MAC(a3, b1)
+                INTX_RV32_MAC(a4, b0)
+                r4 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 5 (6 products)
+                INTX_RV32_MAC(a0, b5)
+                INTX_RV32_MAC(a1, b4)
+                INTX_RV32_MAC(a2, b3)
+                INTX_RV32_MAC(a3, b2)
+                INTX_RV32_MAC(a4, b1)
+                INTX_RV32_MAC(a5, b0)
+                r5 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 6 (7 products)
+                INTX_RV32_MAC(a0, b6)
+                INTX_RV32_MAC(a1, b5)
+                INTX_RV32_MAC(a2, b4)
+                INTX_RV32_MAC(a3, b3)
+                INTX_RV32_MAC(a4, b2)
+                INTX_RV32_MAC(a5, b1)
+                INTX_RV32_MAC(a6, b0)
+                r6 = c0; c0 = c1; c1 = c2; c2 = 0;
+
+                // Column 7 (8 products, only low 32 bits needed — no carry-out)
+                INTX_RV32_MAC(a0, b7)
+                INTX_RV32_MAC(a1, b6)
+                INTX_RV32_MAC(a2, b5)
+                INTX_RV32_MAC(a3, b4)
+                INTX_RV32_MAC(a4, b3)
+                INTX_RV32_MAC(a5, b2)
+                INTX_RV32_MAC(a6, b1)
+                INTX_RV32_MAC(a7, b0)
+                r7 = c0;
+
+                #undef INTX_RV32_MAC
+
+                uint<256> p;
+                p[0] = static_cast<uint64_t>(r0) | (static_cast<uint64_t>(r1) << 32);
+                p[1] = static_cast<uint64_t>(r2) | (static_cast<uint64_t>(r3) << 32);
+                p[2] = static_cast<uint64_t>(r4) | (static_cast<uint64_t>(r5) << 32);
+                p[3] = static_cast<uint64_t>(r6) | (static_cast<uint64_t>(r7) << 32);
+                return p;
+            }
+        }
+#endif
+
         uint<N> p;
         for (size_t j = 0; j < num_words; j++)
         {
@@ -1076,6 +1285,17 @@ public:
     {
         if constexpr (N == 256)
         {
+            // On rv32im (no __int128), direct word-by-word comparison from MSW to LSW
+            // avoids constructing uint128 temporaries and generates tighter code.
+#if defined(__riscv) && __riscv_xlen == 32
+            // Compare from most significant word to least significant.
+            for (size_t i = num_words; i > 0; --i)
+            {
+                if (x[i - 1] != y[i - 1])
+                    return x[i - 1] < y[i - 1];
+            }
+            return false;  // Equal.
+#else
             auto xp = uint128{x[2], x[3]};
             auto yp = uint128{y[2], y[3]};
             if (xp == yp)
@@ -1084,6 +1304,7 @@ public:
                 yp = uint128{y[0], y[1]};
             }
             return xp < yp;
+#endif
         }
         else
             return subc(x, y).carry;
@@ -1279,6 +1500,137 @@ inline const uint8_t* as_bytes(const T& x) noexcept
     static_assert(std::is_trivially_copyable_v<T>);  // As in bit_cast.
     return reinterpret_cast<const uint8_t*>(&x);
 }
+
+#if defined(__riscv) && __riscv_xlen == 32
+/// rv32im specialization: full uint256 x uint256 -> uint512 multiply using
+/// native uint32_t limbs. Fully unrolled column-wise schoolbook with a 96-bit
+/// accumulator {c2,c1,c0} to handle carry without overflow.
+/// 64 mul+mulhu pairs, all branchless.
+constexpr uint<512> umul(const uint<256>& x, const uint<256>& y) noexcept
+{
+    const uint32_t a0 = static_cast<uint32_t>(x[0]);
+    const uint32_t a1 = static_cast<uint32_t>(x[0] >> 32);
+    const uint32_t a2 = static_cast<uint32_t>(x[1]);
+    const uint32_t a3 = static_cast<uint32_t>(x[1] >> 32);
+    const uint32_t a4 = static_cast<uint32_t>(x[2]);
+    const uint32_t a5 = static_cast<uint32_t>(x[2] >> 32);
+    const uint32_t a6 = static_cast<uint32_t>(x[3]);
+    const uint32_t a7 = static_cast<uint32_t>(x[3] >> 32);
+
+    const uint32_t b0 = static_cast<uint32_t>(y[0]);
+    const uint32_t b1 = static_cast<uint32_t>(y[0] >> 32);
+    const uint32_t b2 = static_cast<uint32_t>(y[1]);
+    const uint32_t b3 = static_cast<uint32_t>(y[1] >> 32);
+    const uint32_t b4 = static_cast<uint32_t>(y[2]);
+    const uint32_t b5 = static_cast<uint32_t>(y[2] >> 32);
+    const uint32_t b6 = static_cast<uint32_t>(y[3]);
+    const uint32_t b7 = static_cast<uint32_t>(y[3] >> 32);
+
+    uint32_t c0 = 0, c1 = 0, c2 = 0;
+    uint64_t t;
+
+    // MAC: accumulate one uint32_t x uint32_t product into 96-bit {c2,c1,c0}.
+    #define INTX_RV32_UMUL_MAC(ai, bj)                                      \
+        t = static_cast<uint64_t>(ai) * (bj);                               \
+        c0 += static_cast<uint32_t>(t);                                     \
+        t = static_cast<uint64_t>(c1) +                                     \
+            static_cast<uint32_t>(t >> 32) + (c0 < static_cast<uint32_t>(t)); \
+        c1 = static_cast<uint32_t>(t);                                      \
+        c2 += static_cast<uint32_t>(t >> 32);
+
+    uint32_t r[16];
+
+    // Column 0
+    t = static_cast<uint64_t>(a0) * b0;
+    c0 = static_cast<uint32_t>(t); c1 = static_cast<uint32_t>(t >> 32); c2 = 0;
+    r[0] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 1
+    INTX_RV32_UMUL_MAC(a0, b1) INTX_RV32_UMUL_MAC(a1, b0)
+    r[1] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 2
+    INTX_RV32_UMUL_MAC(a0, b2) INTX_RV32_UMUL_MAC(a1, b1)
+    INTX_RV32_UMUL_MAC(a2, b0)
+    r[2] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 3
+    INTX_RV32_UMUL_MAC(a0, b3) INTX_RV32_UMUL_MAC(a1, b2)
+    INTX_RV32_UMUL_MAC(a2, b1) INTX_RV32_UMUL_MAC(a3, b0)
+    r[3] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 4
+    INTX_RV32_UMUL_MAC(a0, b4) INTX_RV32_UMUL_MAC(a1, b3)
+    INTX_RV32_UMUL_MAC(a2, b2) INTX_RV32_UMUL_MAC(a3, b1)
+    INTX_RV32_UMUL_MAC(a4, b0)
+    r[4] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 5
+    INTX_RV32_UMUL_MAC(a0, b5) INTX_RV32_UMUL_MAC(a1, b4)
+    INTX_RV32_UMUL_MAC(a2, b3) INTX_RV32_UMUL_MAC(a3, b2)
+    INTX_RV32_UMUL_MAC(a4, b1) INTX_RV32_UMUL_MAC(a5, b0)
+    r[5] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 6
+    INTX_RV32_UMUL_MAC(a0, b6) INTX_RV32_UMUL_MAC(a1, b5)
+    INTX_RV32_UMUL_MAC(a2, b4) INTX_RV32_UMUL_MAC(a3, b3)
+    INTX_RV32_UMUL_MAC(a4, b2) INTX_RV32_UMUL_MAC(a5, b1)
+    INTX_RV32_UMUL_MAC(a6, b0)
+    r[6] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 7
+    INTX_RV32_UMUL_MAC(a0, b7) INTX_RV32_UMUL_MAC(a1, b6)
+    INTX_RV32_UMUL_MAC(a2, b5) INTX_RV32_UMUL_MAC(a3, b4)
+    INTX_RV32_UMUL_MAC(a4, b3) INTX_RV32_UMUL_MAC(a5, b2)
+    INTX_RV32_UMUL_MAC(a6, b1) INTX_RV32_UMUL_MAC(a7, b0)
+    r[7] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 8
+    INTX_RV32_UMUL_MAC(a1, b7) INTX_RV32_UMUL_MAC(a2, b6)
+    INTX_RV32_UMUL_MAC(a3, b5) INTX_RV32_UMUL_MAC(a4, b4)
+    INTX_RV32_UMUL_MAC(a5, b3) INTX_RV32_UMUL_MAC(a6, b2)
+    INTX_RV32_UMUL_MAC(a7, b1)
+    r[8] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 9
+    INTX_RV32_UMUL_MAC(a2, b7) INTX_RV32_UMUL_MAC(a3, b6)
+    INTX_RV32_UMUL_MAC(a4, b5) INTX_RV32_UMUL_MAC(a5, b4)
+    INTX_RV32_UMUL_MAC(a6, b3) INTX_RV32_UMUL_MAC(a7, b2)
+    r[9] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 10
+    INTX_RV32_UMUL_MAC(a3, b7) INTX_RV32_UMUL_MAC(a4, b6)
+    INTX_RV32_UMUL_MAC(a5, b5) INTX_RV32_UMUL_MAC(a6, b4)
+    INTX_RV32_UMUL_MAC(a7, b3)
+    r[10] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 11
+    INTX_RV32_UMUL_MAC(a4, b7) INTX_RV32_UMUL_MAC(a5, b6)
+    INTX_RV32_UMUL_MAC(a6, b5) INTX_RV32_UMUL_MAC(a7, b4)
+    r[11] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 12
+    INTX_RV32_UMUL_MAC(a5, b7) INTX_RV32_UMUL_MAC(a6, b6)
+    INTX_RV32_UMUL_MAC(a7, b5)
+    r[12] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 13
+    INTX_RV32_UMUL_MAC(a6, b7) INTX_RV32_UMUL_MAC(a7, b6)
+    r[13] = c0; c0 = c1; c1 = c2; c2 = 0;
+
+    // Column 14
+    INTX_RV32_UMUL_MAC(a7, b7)
+    r[14] = c0; r[15] = c1;
+
+    #undef INTX_RV32_UMUL_MAC
+
+    uint<512> p;
+    for (unsigned w = 0; w < 8; ++w)
+        p[w] = static_cast<uint64_t>(r[2 * w]) |
+               (static_cast<uint64_t>(r[2 * w + 1]) << 32);
+    return p;
+}
+#endif
 
 template <unsigned N>
 constexpr uint<2 * N> umul(const uint<N>& x, const uint<N>& y) noexcept
