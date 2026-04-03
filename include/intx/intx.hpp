@@ -1061,6 +1061,19 @@ public:
 
     friend constexpr uint operator+(const uint& x, const uint& y) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (N == 256) {
+            if (!std::is_constant_evaluated()) {
+                alignas(32) uint r = x;
+                alignas(32) uint b = y;
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&r);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                register uint32_t a2 asm("x12") = 0x01;  // ADD
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                return r;
+            }
+        }
+#endif
         return addc(x, y).value;
     }
 
@@ -1070,6 +1083,19 @@ public:
 
     friend constexpr uint operator-(const uint& x, const uint& y) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (N == 256) {
+            if (!std::is_constant_evaluated()) {
+                alignas(32) uint r = x;
+                alignas(32) uint b = y;
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&r);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                register uint32_t a2 asm("x12") = 0x02;  // SUB
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                return r;
+            }
+        }
+#endif
         return subc(x, y).value;
     }
 
@@ -1079,6 +1105,19 @@ public:
     /// and discarding the high part of the result product.
     friend constexpr uint operator*(const uint& x, const uint& y) noexcept
     {
+#if defined(AIRBENDER) && defined(__riscv)
+        if constexpr (N == 256) {
+            if (!std::is_constant_evaluated()) {
+                alignas(32) uint r = x;
+                alignas(32) uint b = y;
+                register uintptr_t a0 asm("x10") = reinterpret_cast<uintptr_t>(&r);
+                register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+                register uint32_t a2 asm("x12") = 0x08;  // MUL_LOW
+                asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+                return r;
+            }
+        }
+#endif
 #if defined(__riscv) && __riscv_xlen == 32
         // rv32im specialization for uint256: work with native uint32_t limbs.
         // Each uint64_t word is two uint32_t halves (little-endian), giving 8 limbs
@@ -1508,6 +1547,26 @@ inline const uint8_t* as_bytes(const T& x) noexcept
 /// 64 mul+mulhu pairs, all branchless.
 constexpr uint<512> umul(const uint<256>& x, const uint<256>& y) noexcept
 {
+#if defined(AIRBENDER)
+    if (!std::is_constant_evaluated()) {
+        alignas(32) uint<256> lo = x;
+        alignas(32) uint<256> hi = x;
+        alignas(32) uint<256> b = y;
+        register uintptr_t a0 asm("x10");
+        register uintptr_t a1 asm("x11") = reinterpret_cast<uintptr_t>(&b);
+        register uint32_t a2 asm("x12");
+
+        a0 = reinterpret_cast<uintptr_t>(&lo);
+        a2 = 0x08;  // MUL_LOW
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+
+        a0 = reinterpret_cast<uintptr_t>(&hi);
+        a2 = 0x10;  // MUL_HIGH
+        asm volatile("csrrw x0, 0x7CA, x0" : "+r"(a2) : "r"(a0), "r"(a1) : "memory");
+
+        return {lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]};
+    }
+#endif
     const uint32_t a0 = static_cast<uint32_t>(x[0]);
     const uint32_t a1 = static_cast<uint32_t>(x[0] >> 32);
     const uint32_t a2 = static_cast<uint32_t>(x[1]);
