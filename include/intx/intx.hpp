@@ -1018,7 +1018,13 @@ public:
 
     constexpr const uint64_t& operator[](size_t i) const noexcept { return words_[i]; }
 
-    constexpr explicit operator bool() const noexcept { return *this != uint{}; }
+    constexpr explicit operator bool() const noexcept
+    {
+        uint64_t folded = 0;
+        for (size_t i = 0; i < num_words; ++i)
+            folded |= words_[i];
+        return folded != 0;
+    }
 
     /// Explicit converting operator to smaller uint types.
     template <unsigned M>
@@ -2202,10 +2208,24 @@ inline T load(const uint8_t (&src)[M]) noexcept
 {
     static_assert(M <= sizeof(T),
         "the size of source bytes must not exceed the size of the destination uint");
-    T x{};
-    std::memcpy(&as_bytes(x)[sizeof(T) - M], src, M);
-    x = to_big_endian(x);
-    return x;
+#if defined(AIRBENDER) && defined(__riscv)
+    if constexpr (M == sizeof(T) && sizeof(T) == 32)
+    {
+        // Full-size load: skip zero-init, memcpy overwrites all bytes.
+        alignas(32) char raw_[sizeof(T)];
+        auto& x = *reinterpret_cast<T*>(raw_);
+        std::memcpy(raw_, src, M);
+        x = to_big_endian(x);
+        return x;
+    }
+    else
+#endif
+    {
+        T x{};
+        std::memcpy(&as_bytes(x)[sizeof(T) - M], src, M);
+        x = to_big_endian(x);
+        return x;
+    }
 }
 
 /// Loads an integer value from the span of bytes of big-endian order.
