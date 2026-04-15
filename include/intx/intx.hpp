@@ -2401,6 +2401,36 @@ inline IntT load(const uint8_t* src) noexcept
         copy32(&aligned_storage, src);
         return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
     }
+    else if constexpr (sizeof(IntT) == 8)
+    {
+        // Inline 8-byte BE load: construct numeric value directly from bytes.
+        // Avoids memcpy function call on rv32 with -fno-builtin.
+        const auto hi = static_cast<uint32_t>(src[0]) << 24
+                      | static_cast<uint32_t>(src[1]) << 16
+                      | static_cast<uint32_t>(src[2]) << 8
+                      | static_cast<uint32_t>(src[3]);
+        const auto lo = static_cast<uint32_t>(src[4]) << 24
+                      | static_cast<uint32_t>(src[5]) << 16
+                      | static_cast<uint32_t>(src[6]) << 8
+                      | static_cast<uint32_t>(src[7]);
+        return static_cast<IntT>((static_cast<uint64_t>(hi) << 32) | lo);
+    }
+    else if constexpr (sizeof(IntT) == 4)
+    {
+        // Inline 4-byte BE load: construct value directly from bytes.
+        return static_cast<IntT>(
+            static_cast<uint32_t>(src[0]) << 24
+          | static_cast<uint32_t>(src[1]) << 16
+          | static_cast<uint32_t>(src[2]) << 8
+          | static_cast<uint32_t>(src[3]));
+    }
+    else if constexpr (sizeof(IntT) == 2)
+    {
+        // Inline 2-byte BE load.
+        return static_cast<IntT>(
+            static_cast<uint16_t>(src[0]) << 8
+          | static_cast<uint16_t>(src[1]));
+    }
     else
 #endif
     {
@@ -2419,8 +2449,45 @@ inline IntT load(const uint8_t* src) noexcept
 template <typename T>
 inline void store(uint8_t* dst, const T& x) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if constexpr (sizeof(T) == 8)
+    {
+        // Inline 8-byte BE store: decompose numeric value directly into bytes.
+        const auto v = static_cast<uint64_t>(x);
+        const auto hi = static_cast<uint32_t>(v >> 32);
+        const auto lo = static_cast<uint32_t>(v);
+        dst[0] = static_cast<uint8_t>(hi >> 24);
+        dst[1] = static_cast<uint8_t>(hi >> 16);
+        dst[2] = static_cast<uint8_t>(hi >> 8);
+        dst[3] = static_cast<uint8_t>(hi);
+        dst[4] = static_cast<uint8_t>(lo >> 24);
+        dst[5] = static_cast<uint8_t>(lo >> 16);
+        dst[6] = static_cast<uint8_t>(lo >> 8);
+        dst[7] = static_cast<uint8_t>(lo);
+    }
+    else if constexpr (sizeof(T) == 4)
+    {
+        const auto v = static_cast<uint32_t>(x);
+        dst[0] = static_cast<uint8_t>(v >> 24);
+        dst[1] = static_cast<uint8_t>(v >> 16);
+        dst[2] = static_cast<uint8_t>(v >> 8);
+        dst[3] = static_cast<uint8_t>(v);
+    }
+    else if constexpr (sizeof(T) == 2)
+    {
+        const auto v = static_cast<uint16_t>(x);
+        dst[0] = static_cast<uint8_t>(v >> 8);
+        dst[1] = static_cast<uint8_t>(v);
+    }
+    else
+    {
+        const auto d = to_big_endian(x);
+        std::memcpy(dst, &d, sizeof(d));
+    }
+#else
     const auto d = to_big_endian(x);
     std::memcpy(dst, &d, sizeof(d));
+#endif
 }
 
 /// Specialization for uint256.
