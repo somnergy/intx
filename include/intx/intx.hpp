@@ -1037,10 +1037,25 @@ public:
 
     constexpr explicit operator bool() const noexcept
     {
+#if defined(__riscv) && __riscv_xlen == 32
+        // On rv32im, short-circuit on the low word for the common case.
+        // Most EVM non-zero values (booleans, addresses, counters) have non-zero
+        // low bits, so this avoids loading and OR-folding all 8 uint32 halves.
+        // Uses uint32_t to avoid 64-bit decomposition overhead.
+        const auto* w = reinterpret_cast<const uint32_t*>(words_);
+        if ((w[0] | w[1]) != 0)
+            return true;
+        // Fall through: check upper words only if low word is zero.
+        uint32_t upper = 0;
+        for (size_t i = 2; i < num_words * 2; ++i)
+            upper |= w[i];
+        return upper != 0;
+#else
         uint64_t folded = 0;
         for (size_t i = 0; i < num_words; ++i)
             folded |= words_[i];
         return folded != 0;
+#endif
     }
 
     /// Explicit converting operator to smaller uint types.
