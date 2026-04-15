@@ -983,7 +983,14 @@ private:
     uint64_t words_[num_words]{};
 
 public:
+    /// Tag type for constructing without zero-initialization.
+    struct uninit_tag {};
+
     constexpr uint() noexcept = default;
+
+    /// Construct without zero-initializing the storage.
+    /// The caller MUST fully overwrite all words before reading.
+    constexpr explicit uint(uninit_tag) noexcept {}
 
     /// Implicit converting constructor for any smaller uint type.
     template <unsigned M>
