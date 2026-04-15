@@ -980,17 +980,23 @@ struct uint
     static_assert(N % word_num_bits == 0, "Number of bits must be a multiply of 64");
 
 private:
-    uint64_t words_[num_words]{};
+    uint64_t words_[num_words];
 
 public:
     /// Tag type for constructing without zero-initialization.
     struct uninit_tag {};
 
-    constexpr uint() noexcept = default;
+    constexpr uint() noexcept : words_{} {}
 
-    /// Construct without zero-initializing the storage.
+    /// Construct without zero-initializing the storage at runtime.
     /// The caller MUST fully overwrite all words before reading.
-    constexpr explicit uint(uninit_tag) noexcept {}
+    /// In constexpr context, zero-inits for correctness; at runtime, truly uninitialized.
+    constexpr explicit uint(uninit_tag) noexcept
+    {
+        if (std::is_constant_evaluated())
+            for (auto& w : words_)
+                w = 0;
+    }
 
     /// Implicit converting constructor for any smaller uint type.
     template <unsigned M>
@@ -999,6 +1005,8 @@ public:
     {
         for (size_t i = 0; i < uint<M>::num_words; ++i)
             words_[i] = x[i];
+        for (size_t i = uint<M>::num_words; i < num_words; ++i)
+            words_[i] = 0;
     }
 
 #if INTX_HAS_BUILTIN_INT128
@@ -1019,6 +1027,8 @@ public:
     {
         INTX_REQUIRE(words.size() <= num_words);
         std::ranges::copy(words, words_);
+        for (size_t i = words.size(); i < num_words; ++i)
+            words_[i] = 0;
     }
 
     constexpr uint64_t& operator[](size_t i) noexcept { return words_[i]; }
