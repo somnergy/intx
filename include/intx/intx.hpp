@@ -2215,13 +2215,23 @@ inline T load(const uint8_t (&src)[M]) noexcept
 {
     static_assert(M <= sizeof(T),
         "the size of source bytes must not exceed the size of the destination uint");
-#if defined(AIRBENDER) && defined(__riscv)
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
     if constexpr (M == sizeof(T) && sizeof(T) == 32)
     {
-        // Full-size load: skip zero-init, memcpy overwrites all bytes.
+        // Full-size load: inline word copy avoids memcpy function call overhead.
         alignas(32) char raw_[sizeof(T)];
+        auto* d = reinterpret_cast<uint32_t*>(raw_);
+        if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
+        {
+            const auto* s = reinterpret_cast<const uint32_t*>(src);
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+            d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7];
+        }
+        else
+        {
+            std::memcpy(raw_, src, M);
+        }
         auto& x = *reinterpret_cast<T*>(raw_);
-        std::memcpy(raw_, src, M);
         x = to_big_endian(x);
         return x;
     }
@@ -2260,8 +2270,22 @@ inline IntT load(const T& t) noexcept
 template <typename T>
 inline void store(uint8_t (&dst)[sizeof(T)], const T& x) noexcept
 {
-    const auto d = to_big_endian(x);
-    std::memcpy(dst, &d, sizeof(d));
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if constexpr (sizeof(T) == 32)
+    {
+        // Inline bswap + word-store to avoid memcpy function call overhead.
+        const auto d = to_big_endian(x);
+        const auto* s = reinterpret_cast<const uint32_t*>(&d);
+        auto* dd = reinterpret_cast<uint32_t*>(dst);
+        dd[0] = s[0]; dd[1] = s[1]; dd[2] = s[2]; dd[3] = s[3];
+        dd[4] = s[4]; dd[5] = s[5]; dd[6] = s[6]; dd[7] = s[7];
+    }
+    else
+#endif
+    {
+        const auto d = to_big_endian(x);
+        std::memcpy(dst, &d, sizeof(d));
+    }
 }
 
 /// Stores an integer value into the span of bytes in big-endian order.
@@ -2319,18 +2343,50 @@ inline T trunc(const uint<N>& x) noexcept
 
 namespace unsafe
 {
+
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+/// Inline 32-byte copy: avoids calling memcpy (which is a function call under -fno-builtin)
+/// for the hot 32-byte load path (MLOAD, SLOAD key conversion, etc.).
+/// Uses 4-byte word loads when src is 4-byte aligned; falls back to byte loads otherwise.
+inline void copy32(void* dst, const uint8_t* src) noexcept
+{
+    auto* d = static_cast<uint32_t*>(dst);
+    if ((reinterpret_cast<uintptr_t>(src) & 3) == 0)  // 4-byte aligned
+    {
+        const auto* s = reinterpret_cast<const uint32_t*>(src);
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+        d[4] = s[4]; d[5] = s[5]; d[6] = s[6]; d[7] = s[7];
+    }
+    else
+    {
+        std::memcpy(dst, src, 32);
+    }
+}
+#endif
+
 /// Loads an uint value from a buffer. The user must make sure
 /// that the provided buffer is big enough. Therefore, marked "unsafe".
 template <typename IntT>
 inline IntT load(const uint8_t* src) noexcept
 {
-    // Align bytes.
-    // TODO: Using memcpy() directly triggers this optimization bug in GCC:
-    //   https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
-    alignas(IntT) std::byte aligned_storage[sizeof(IntT)];
-    std::memcpy(&aligned_storage, src, sizeof(IntT));
-    // TODO(C++23): Use std::start_lifetime_as<uint256>().
-    return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    if constexpr (sizeof(IntT) == 32)
+    {
+        alignas(32) std::byte aligned_storage[32];
+        copy32(&aligned_storage, src);
+        return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+    }
+    else
+#endif
+    {
+        // Align bytes.
+        // TODO: Using memcpy() directly triggers this optimization bug in GCC:
+        //   https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
+        alignas(IntT) std::byte aligned_storage[sizeof(IntT)];
+        std::memcpy(&aligned_storage, src, sizeof(IntT));
+        // TODO(C++23): Use std::start_lifetime_as<uint256>().
+        return to_big_endian(*reinterpret_cast<const IntT*>(&aligned_storage));
+    }
 }
 
 /// Stores an integer value at the provided pointer in big-endian order. The user must make sure
@@ -2345,6 +2401,30 @@ inline void store(uint8_t* dst, const T& x) noexcept
 /// Specialization for uint256.
 inline void store(uint8_t* dst, const uint256& x) noexcept
 {
+#if defined(AIRBENDER) && defined(__riscv) && __riscv_xlen == 32
+    // On rv32im with -fno-builtin, std::memcpy is a function call. Inline the
+    // bswap + store to avoid 4 function calls for 8-byte memcpy chunks.
+    // bswap each uint64 word → 2 x bswap32 + swap halves, then store as uint32 words.
+    const auto v0 = to_big_endian(x[0]);
+    const auto v1 = to_big_endian(x[1]);
+    const auto v2 = to_big_endian(x[2]);
+    const auto v3 = to_big_endian(x[3]);
+    if ((reinterpret_cast<uintptr_t>(dst) & 3) == 0)  // 4-byte aligned
+    {
+        auto* d = reinterpret_cast<uint32_t*>(dst);
+        d[0] = static_cast<uint32_t>(v3);       d[1] = static_cast<uint32_t>(v3 >> 32);
+        d[2] = static_cast<uint32_t>(v2);       d[3] = static_cast<uint32_t>(v2 >> 32);
+        d[4] = static_cast<uint32_t>(v1);       d[5] = static_cast<uint32_t>(v1 >> 32);
+        d[6] = static_cast<uint32_t>(v0);       d[7] = static_cast<uint32_t>(v0 >> 32);
+    }
+    else
+    {
+        std::memcpy(dst, &v3, sizeof(v3));
+        std::memcpy(dst + 8, &v2, sizeof(v2));
+        std::memcpy(dst + 16, &v1, sizeof(v1));
+        std::memcpy(dst + 24, &v0, sizeof(v0));
+    }
+#else
     // Store byte-swapped words in primitive temporaries. This helps with memory aliasing
     // and GCC bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=107837
     // TODO: Use std::byte instead of uint8_t.
@@ -2358,6 +2438,7 @@ inline void store(uint8_t* dst, const uint256& x) noexcept
     std::memcpy(dst + 8, &v2, sizeof(v2));
     std::memcpy(dst + 16, &v1, sizeof(v1));
     std::memcpy(dst + 24, &v0, sizeof(v0));
+#endif
 }
 
 }  // namespace unsafe
