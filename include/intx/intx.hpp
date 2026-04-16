@@ -2079,6 +2079,27 @@ constexpr div_result<uint<N>> sdivrem(const uint<N>& u, const uint<N>& v) noexce
 
 constexpr uint256 bswap(const uint256& x) noexcept
 {
+#if defined(__riscv) && __riscv_xlen == 32 && !defined(__riscv_zbb)
+    // Inline bswap32 logic with shared mask constants across all 8 half-word swaps.
+    // Saves ~30 insns vs 8 separate bswap32 calls that each reconstruct the masks.
+    if (!std::is_constant_evaluated())
+    {
+        // Hoist the byte-swap mask constants so they're computed once.
+        const uint32_t m1 = 0xFF00FF00u;
+        const uint32_t m2 = 0x00FF00FFu;
+        auto bs = [m1, m2](uint32_t v) -> uint32_t {
+            const auto a = ((v << 8) & m1) | ((v >> 8) & m2);
+            return (a << 16) | (a >> 16);
+        };
+        // bswap64(w) = (bswap32(lo) << 32) | bswap32(hi), then reverse word order.
+        auto bs64 = [&bs](uint64_t w) -> uint64_t {
+            const auto lo = static_cast<uint32_t>(w);
+            const auto hi = static_cast<uint32_t>(w >> 32);
+            return (static_cast<uint64_t>(bs(lo)) << 32) | bs(hi);
+        };
+        return {bs64(x[3]), bs64(x[2]), bs64(x[1]), bs64(x[0])};
+    }
+#endif
     return {bswap(x[3]), bswap(x[2]), bswap(x[1]), bswap(x[0])};
 }
 
